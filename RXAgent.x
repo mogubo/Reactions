@@ -383,7 +383,67 @@ static void RXALogRegistration(NSString *label, id body) {
     }
 }
 
+// iOS 6 looks up a contact's devices with FTiMessageIDQuery (one URI per query); the response carries each device's
+// client-data. Logged like RXALogQuery: flags verbatim, data/strings as lengths, no URIs, tokens or keys.
+static void RXALogIdentityArray(NSString *label, id identities) {
+    if (![identities isKindOfClass:[NSArray class]]) {
+        return;
+    }
+    NSUInteger i = 0;
+    for (id identity in (NSArray *)identities) {
+        i++;
+        if (![identity isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSMutableArray *other = [NSMutableArray array];
+        for (id key in [identity allKeys]) {
+            if (![key isEqual:@"client-data"]) {
+                [other addObject:[key description]];
+            }
+        }
+        [other sortUsingSelector:@selector(compare:)];
+        id clientData = [identity objectForKey:@"client-data"];
+        NSString *cd = [clientData isKindOfClass:[NSDictionary class]] ? RXADescribeDict(clientData, 0) : @"none";
+        RXALog([NSString stringWithFormat:@"QUERY %@ device %lu: keys=[%@] client-data=%@", label, (unsigned long)i,
+                [other componentsJoinedByString:@","], cd]);
+    }
+}
+
 %group RXARegistration
+%hook FTiMessageIDQuery
+- (void)handleResponseDictionary:(id)response {
+    @try {
+        if ([response isKindOfClass:[NSDictionary class]]) {
+            NSMutableArray *keys = [NSMutableArray array];
+            for (id key in [response allKeys]) {
+                [keys addObject:[key description]];
+            }
+            [keys sortUsingSelector:@selector(compare:)];
+            RXALog([NSString stringWithFormat:@"QUERY response: status=%@ keys=[%@]",
+                    [response objectForKey:@"status"], [keys componentsJoinedByString:@","]]);
+            RXALogIdentityArray(@"id", [response objectForKey:@"identities"]);
+            id results = [response objectForKey:@"results"];
+            if ([results isKindOfClass:[NSDictionary class]]) {
+                NSUInteger h = 0;
+                for (id uri in (NSDictionary *)results) {
+                    h++;
+                    id entry = [(NSDictionary *)results objectForKey:uri];
+                    if ([entry isKindOfClass:[NSDictionary class]]) {
+                        RXALogIdentityArray([NSString stringWithFormat:@"#%lu", (unsigned long)h],
+                                            [entry objectForKey:@"identities"]);
+                    }
+                }
+            }
+        } else {
+            RXALog([NSString stringWithFormat:@"QUERY response class %@", NSStringFromClass([response class])]);
+        }
+    } @catch (NSException *e) {
+        RXALog(@"QUERY response: logging failed");
+    }
+    %orig;
+}
+%end
+
 %hook FTRegistrationMessage
 - (id)messageBody {
     id body = %orig;
@@ -501,7 +561,7 @@ static void RXADumpClasses(NSString *reason) {
         } else {
             RXALog(@"FTRegistrationMessage not found: registration logging off");
         }
-        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A.5 (diagnostics + tapback declaration + query log)", (int)getpid()]);
+        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A.6 (diagnostics + tapback declaration + query log)", (int)getpid()]);
         dispatch_queue_t bg = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), bg, ^{
             RXADumpClasses(@"30 s");

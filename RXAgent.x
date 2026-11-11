@@ -411,8 +411,9 @@ static CFPropertyListRef RXAOutgoingFilter(CFPropertyListRef plist, NSDictionary
 // devices put capability flags in client-data (top level on iOS 6; services[].users[].client-data in rustpush,
 // src/ids/user.rs and src/imessage/aps_client.rs). Only the two tapback flags are added, and only into a
 // client-data dictionary that already exists: nothing else changes. Off switch: create the file
-// /var/mobile/Library/Reactions/no-declare (then re-register).
-#define RXA_NO_DECLARE   @"/var/mobile/Library/Reactions/no-declare"
+// OFF by default since 2026-11-11 (it did not make iOS 27 send amk/amt, and iMessage later stayed on "waiting for
+// activation"). Opt-in only: create /var/mobile/Library/Reactions/declare.
+#define RXA_DECLARE      @"/var/mobile/Library/Reactions/declare"
 #define RXA_MADRID       @"com.apple.madrid"
 
 static NSArray *RXATapbackFlags(void) {
@@ -569,8 +570,8 @@ static void RXALogIdentityArray(NSString *label, id identities) {
     @try {
         RXALogRegistration(@"body", body);
         if ([body isKindOfClass:[NSDictionary class]]) {
-            if ([[NSFileManager defaultManager] fileExistsAtPath:RXA_NO_DECLARE]) {
-                RXALog(@"REGISTRATION declare: off (no-declare file present)");
+            if (![[NSFileManager defaultManager] fileExistsAtPath:RXA_DECLARE]) {
+                RXALog(@"REGISTRATION declare: off (default; create the declare file to enable)");
             } else {
                 NSUInteger added = 0, users = 0;
                 result = RXAWithTapbackFlags(body, &added, &users);

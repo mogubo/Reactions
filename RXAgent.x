@@ -1,4 +1,4 @@
-// Reactions - RXAgent.x: the part that loads into imagent (ReactionsAgent.plist filters on the imagent
+// Reactions - RXAgent.x (phase 1A.2): the part that loads into imagent (ReactionsAgent.plist filters on the imagent
 // executable). Phase 1A: DIAGNOSTICS ONLY. It changes no behaviour and sends nothing.
 //
 // imagent is the iOS 6 daemon that receives and decrypts iMessages. Newer iPhones send a tapback as an
@@ -92,10 +92,27 @@ static NSSet *RXAVerbatimKeys(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         keys = [NSSet setWithObjects:@"amk", @"amt", @"amrlc", @"amrln", @"ame", @"amc", @"pv", @"gv", @"v",
-                @"r", @"tg", @"bid", @"are", @"arc", @"iid", @"type", @"et", @"epi", @"emg", nil];
+                @"r", @"tg", @"bid", @"are", @"arc", @"aogre", @"aogrs", @"iid", @"type", @"et", @"epi", @"emg", nil];
     });
     return keys;
 }
+
+// Registration body (what this iPhone declares to Apple): versions, service names, capability flags.
+// Never push tokens, certificates, keys, validation data, phone numbers or e-mails (data -> length,
+// other strings -> length, arrays of strings -> count).
+static NSSet *RXARegistrationKeys(void) {
+    static NSSet *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = [NSSet setWithObjects:@"os-version", @"software-version", @"hardware-version", @"protocol-version",
+                @"service", @"name", @"flags", @"version", @"client-data", @"capabilities", @"sub-services",
+                @"language", @"region", nil];
+    });
+    return keys;
+}
+
+static NSSet *gRXAVerbatim;          // allowlist in use for the current description (main thread / caller)
+static BOOL gRXADescendArrays;       // registration: describe dictionaries inside arrays
 
 static NSString *RXADescribe(id value, BOOL verbatim, int depth);
 
@@ -106,7 +123,7 @@ static NSString *RXADescribeDict(NSDictionary *dict, int depth) {
     NSMutableArray *items = [NSMutableArray array];
     for (id key in keys) {
         NSString *name = [key isKindOfClass:[NSString class]] ? key : [key description];
-        BOOL verbatim = [RXAVerbatimKeys() containsObject:name];
+        BOOL verbatim = [(gRXAVerbatim ? gRXAVerbatim : RXAVerbatimKeys()) containsObject:name];
         NSString *desc = RXADescribe([dict objectForKey:key], verbatim, depth + 1);
         [items addObject:[NSString stringWithFormat:@"%@=%@", name, desc ? desc : @"?"]];
     }
@@ -145,11 +162,26 @@ static NSString *RXADescribe(id value, BOOL verbatim, int depth) {
         return out;
     }
     if ([value isKindOfClass:[NSArray class]]) {
-        // Never the elements: "p" holds the participants' phone numbers / e-mails.
-        return [NSString stringWithFormat:@"array(%lu)", (unsigned long)[(NSArray *)value count]];
+        // Never string elements: "p" holds the participants' phone numbers / e-mails.
+        NSArray *array = value;
+        if (gRXADescendArrays && depth < 6) {
+            NSMutableArray *items = [NSMutableArray array];
+            for (id element in array) {
+                if ([element isKindOfClass:[NSDictionary class]]) {
+                    [items addObject:RXADescribeDict(element, depth)];
+                } else if (verbatim && [element isKindOfClass:[NSString class]]) {
+                    [items addObject:[NSString stringWithFormat:@"\"%@\"", element]];
+                }
+            }
+            if ([items count]) {
+                return [NSString stringWithFormat:@"array(%lu)[%@]", (unsigned long)[array count],
+                        [items componentsJoinedByString:@", "]];
+            }
+        }
+        return [NSString stringWithFormat:@"array(%lu)", (unsigned long)[array count]];
     }
     if ([value isKindOfClass:[NSDictionary class]]) {
-        return depth < 3 ? RXADescribeDict(value, depth) : @"dict";
+        return depth < (gRXADescendArrays ? 6 : 3) ? RXADescribeDict(value, depth) : @"dict";
     }
     if ([value isKindOfClass:[NSDate class]]) {
         return [NSString stringWithFormat:@"date(%.3f)", [(NSDate *)value timeIntervalSinceReferenceDate]];
@@ -210,6 +242,33 @@ static void RXAInspect(CFPropertyListRef result, const char *via) {
     RXAInspect(result, "CFPropertyListCreateFromXMLData");
     return result;
 }
+
+#pragma mark - Registration (what iOS 6 declares to Apple's servers)
+
+%group RXARegistration
+%hook FTRegistrationMessage
+- (id)messageBody {
+    id body = %orig;
+    @try {
+        if ([body isKindOfClass:[NSDictionary class]] && [NSThread isMainThread]) {
+            gRXAVerbatim = RXARegistrationKeys();
+            gRXADescendArrays = YES;
+            NSString *desc = RXADescribeDict(body, 0);
+            gRXAVerbatim = nil;
+            gRXADescendArrays = NO;
+            RXALog([NSString stringWithFormat:@"REGISTRATION body: %@", desc]);
+        } else if (body) {
+            RXALog([NSString stringWithFormat:@"REGISTRATION body class %@ (main %d)",
+                    NSStringFromClass([body class]), [NSThread isMainThread] ? 1 : 0]);
+        }
+    } @catch (NSException *e) {
+        gRXAVerbatim = nil;
+        gRXADescendArrays = NO;
+    }
+    return body;
+}
+%end
+%end
 
 #pragma mark - Class listing (runtime introspection)
 
@@ -293,6 +352,11 @@ static void RXADumpClasses(NSString *reason) {
     @autoreleasepool {
         pthread_key_create(&gRXAGuardKey, NULL);
         %init;
+        if (objc_getClass("FTRegistrationMessage")) {
+            %init(RXARegistration);
+        } else {
+            RXALog(@"FTRegistrationMessage not found: registration logging off");
+        }
         RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A diagnostics", (int)getpid()]);
         dispatch_queue_t bg = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), bg, ^{

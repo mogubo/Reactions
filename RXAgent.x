@@ -202,6 +202,47 @@ static BOOL RXALooksLikeMessage(CFDictionaryRef dict) {
     return CFDictionaryContainsKey(dict, CFSTR("t")) && CFDictionaryContainsKey(dict, CFSTR("p"));
 }
 
+// IDS query responses: {status, results={<handle>={identities=[{client-data={...}, push-token, ...}]}}}. This is
+// how the iPhone 5 learns what every device of a contact (and of its own account) declares. Logged: per device,
+// the client-data flags (numbers verbatim, data/strings as lengths) and the other key names. Handles are
+// replaced by "#n" (they are phone numbers / e-mails).
+static void RXALogQuery(NSDictionary *dict, const char *via) {
+    id results = [dict objectForKey:@"results"];
+    if (![results isKindOfClass:[NSDictionary class]]) {
+        return;
+    }
+    RXALog([NSString stringWithFormat:@"QUERY via %s: status=%@, %lu handle(s)", via,
+            [dict objectForKey:@"status"], (unsigned long)[(NSDictionary *)results count]]);
+    NSUInteger h = 0;
+    for (id handle in (NSDictionary *)results) {
+        h++;
+        id entry = [(NSDictionary *)results objectForKey:handle];
+        id identities = [entry isKindOfClass:[NSDictionary class]] ? [entry objectForKey:@"identities"] : nil;
+        if (![identities isKindOfClass:[NSArray class]]) {
+            RXALog([NSString stringWithFormat:@"QUERY #%lu: no identities (%@)", (unsigned long)h,
+                    [entry isKindOfClass:[NSDictionary class]] ? [[entry allKeys] componentsJoinedByString:@","] : @"?"]);
+            continue;
+        }
+        NSUInteger i = 0;
+        for (id identity in (NSArray *)identities) {
+            i++;
+            if (![identity isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            NSMutableArray *other = [NSMutableArray array];
+            for (id key in [[identity allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+                if (![key isEqual:@"client-data"]) {
+                    [other addObject:[key description]];
+                }
+            }
+            id clientData = [identity objectForKey:@"client-data"];
+            NSString *cd = [clientData isKindOfClass:[NSDictionary class]] ? RXADescribeDict(clientData, 0) : @"none";
+            RXALog([NSString stringWithFormat:@"QUERY #%lu device %lu: keys=[%@] client-data=%@", (unsigned long)h,
+                    (unsigned long)i, [other componentsJoinedByString:@","], cd]);
+        }
+    }
+}
+
 static void RXAInspect(CFPropertyListRef result, const char *via) {
     if (!result || CFGetTypeID(result) != CFDictionaryGetTypeID()) {
         return;
@@ -211,7 +252,9 @@ static void RXAInspect(CFPropertyListRef result, const char *via) {
     }
     pthread_setspecific(gRXAGuardKey, (void *)1);
     @try {
-        if (RXALooksLikeMessage((CFDictionaryRef)result)) {
+        if (CFDictionaryContainsKey((CFDictionaryRef)result, CFSTR("results"))) {
+            RXALogQuery((__bridge NSDictionary *)result, via);
+        } else if (RXALooksLikeMessage((CFDictionaryRef)result)) {
             NSDictionary *dict = (__bridge NSDictionary *)result;
             BOOL reaction = [dict objectForKey:@"amk"] || [dict objectForKey:@"amt"];
             RXALog([NSString stringWithFormat:@"CAPTURE %@ via %s: %@", reaction ? @"REACTION" : @"message",
@@ -458,7 +501,7 @@ static void RXADumpClasses(NSString *reason) {
         } else {
             RXALog(@"FTRegistrationMessage not found: registration logging off");
         }
-        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A.3 (diagnostics + tapback declaration)", (int)getpid()]);
+        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A.5 (diagnostics + tapback declaration + query log)", (int)getpid()]);
         dispatch_queue_t bg = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), bg, ^{
             RXADumpClasses(@"30 s");

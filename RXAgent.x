@@ -1,4 +1,4 @@
-// Reactions - RXAgent.x (phase 1A.2): the part that loads into imagent (ReactionsAgent.plist filters on the imagent
+// Reactions - RXAgent.x (phase 1A.3): the part that loads into imagent (ReactionsAgent.plist filters on the imagent
 // executable). Phase 1A: DIAGNOSTICS ONLY. It changes no behaviour and sends nothing.
 //
 // imagent is the iOS 6 daemon that receives and decrypts iMessages. Newer iPhones send a tapback as an
@@ -245,27 +245,107 @@ static void RXAInspect(CFPropertyListRef result, const char *via) {
 
 #pragma mark - Registration (what iOS 6 declares to Apple's servers)
 
+// Phase 1A.3: declare tapback support. iOS 27 strips amk/amt/ame from what it sends to the iPhone 5 (verified
+// 2026-11-11), most likely because this device does not announce the capability when it registers. Modern
+// devices put capability flags in services[service=com.apple.madrid].users[].client-data (rustpush,
+// src/ids/user.rs and src/imessage/aps_client.rs). Only the two tapback flags are added, and only into a
+// client-data dictionary that already exists: nothing else changes. Off switch: create the file
+// /var/mobile/Library/Reactions/no-declare (then re-register).
+#define RXA_NO_DECLARE   @"/var/mobile/Library/Reactions/no-declare"
+#define RXA_MADRID       @"com.apple.madrid"
+
+static NSArray *RXATapbackFlags(void) {
+    // "ack" = acknowledgment, Apple's internal name for tapbacks.
+    return [NSArray arrayWithObjects:@"supports-ack-v1", @"supports-emoji-tapbacks", nil];
+}
+
+static NSDictionary *RXAWithTapbackFlags(NSDictionary *body, NSUInteger *added, NSUInteger *users) {
+    id services = [body objectForKey:@"services"];
+    if (![services isKindOfClass:[NSArray class]]) {
+        return body;
+    }
+    NSMutableArray *newServices = [NSMutableArray array];
+    BOOL changed = NO;
+    for (id service in (NSArray *)services) {
+        if (![service isKindOfClass:[NSDictionary class]] ||
+            ![[service objectForKey:@"service"] isEqual:RXA_MADRID] ||
+            ![[service objectForKey:@"users"] isKindOfClass:[NSArray class]]) {
+            [newServices addObject:service];
+            continue;
+        }
+        NSMutableArray *newUsers = [NSMutableArray array];
+        for (id user in (NSArray *)[service objectForKey:@"users"]) {
+            id clientData = [user isKindOfClass:[NSDictionary class]] ? [user objectForKey:@"client-data"] : nil;
+            if (![clientData isKindOfClass:[NSDictionary class]]) {
+                [newUsers addObject:user];
+                continue;
+            }
+            (*users)++;
+            NSMutableDictionary *newClientData = [clientData mutableCopy];
+            for (NSString *flag in RXATapbackFlags()) {
+                if (![newClientData objectForKey:flag]) {
+                    [newClientData setObject:[NSNumber numberWithBool:YES] forKey:flag];
+                    (*added)++;
+                }
+            }
+            NSMutableDictionary *newUser = [user mutableCopy];
+            [newUser setObject:newClientData forKey:@"client-data"];
+            [newUsers addObject:newUser];
+        }
+        NSMutableDictionary *newService = [service mutableCopy];
+        [newService setObject:newUsers forKey:@"users"];
+        [newServices addObject:newService];
+        changed = YES;
+    }
+    if (!changed || *added == 0) {
+        return body;
+    }
+    NSMutableDictionary *newBody = [body mutableCopy];
+    [newBody setObject:newServices forKey:@"services"];
+    return newBody;
+}
+
+static void RXALogRegistration(NSString *label, id body) {
+    if ([body isKindOfClass:[NSDictionary class]] && [NSThread isMainThread]) {
+        gRXAVerbatim = RXARegistrationKeys();
+        gRXADescendArrays = YES;
+        NSString *desc = RXADescribeDict(body, 0);
+        gRXAVerbatim = nil;
+        gRXADescendArrays = NO;
+        RXALog([NSString stringWithFormat:@"REGISTRATION %@: %@", label, desc]);
+    } else if (body) {
+        RXALog([NSString stringWithFormat:@"REGISTRATION %@ class %@ (main %d)", label,
+                NSStringFromClass([body class]), [NSThread isMainThread] ? 1 : 0]);
+    }
+}
+
 %group RXARegistration
 %hook FTRegistrationMessage
 - (id)messageBody {
     id body = %orig;
+    id result = body;
     @try {
-        if ([body isKindOfClass:[NSDictionary class]] && [NSThread isMainThread]) {
-            gRXAVerbatim = RXARegistrationKeys();
-            gRXADescendArrays = YES;
-            NSString *desc = RXADescribeDict(body, 0);
-            gRXAVerbatim = nil;
-            gRXADescendArrays = NO;
-            RXALog([NSString stringWithFormat:@"REGISTRATION body: %@", desc]);
-        } else if (body) {
-            RXALog([NSString stringWithFormat:@"REGISTRATION body class %@ (main %d)",
-                    NSStringFromClass([body class]), [NSThread isMainThread] ? 1 : 0]);
+        RXALogRegistration(@"body", body);
+        if ([body isKindOfClass:[NSDictionary class]]) {
+            if ([[NSFileManager defaultManager] fileExistsAtPath:RXA_NO_DECLARE]) {
+                RXALog(@"REGISTRATION declare: off (no-declare file present)");
+            } else {
+                NSUInteger added = 0, users = 0;
+                result = RXAWithTapbackFlags(body, &added, &users);
+                RXALog([NSString stringWithFormat:@"REGISTRATION declare: %lu flag(s) added for %lu user(s)",
+                        (unsigned long)added, (unsigned long)users]);
+                if (result != body) {
+                    RXALogRegistration(@"sent", result);
+                }
+            }
         }
     } @catch (NSException *e) {
         gRXAVerbatim = nil;
         gRXADescendArrays = NO;
+        result = body;
+        RXALog(@"REGISTRATION declare failed: original body kept");
     }
-    return body;
+    return result;
 }
 %end
 %end
@@ -357,7 +437,7 @@ static void RXADumpClasses(NSString *reason) {
         } else {
             RXALog(@"FTRegistrationMessage not found: registration logging off");
         }
-        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A diagnostics", (int)getpid()]);
+        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A.3 (diagnostics + tapback declaration)", (int)getpid()]);
         dispatch_queue_t bg = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), bg, ^{
             RXADumpClasses(@"30 s");

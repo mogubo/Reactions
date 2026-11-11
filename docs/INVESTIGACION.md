@@ -1,7 +1,22 @@
 # Investigación: reacciones reales de iMessage en iOS 6
 
-Estado: **hipótesis basada en código público, PENDIENTE de verificar con capturas del iPhone 5 (iOS 6.1.2)**.
-Nada de este documento se da por cierto hasta que aparezca en `Agent.log` (Fase 1A).
+Estado: ver **0. Verificado** (capturas del 2026-11-11). El resto es hipótesis basada en código público.
+
+## 0. Verificado (iPhone 5 iOS 6.1.2 + MacBook Air macOS 27.3, misma cuenta; emisor iOS 27 en es_ES)
+
+* `chat.db` del Mac: las reacciones tienen `associated_message_guid = p:0/<GUID>` y tipos 2000 ❤️, 2001 👍, 2006 🔥
+  (`associated_message_emoji`), 3000 quitar ❤️. Los GUID de destino son exactamente los `guid` de `sms.db` del
+  iPhone 5 (Mensaje1 7A755F24…, Mensaje2 06430095…, Mensaje3 D8933C7D…), y el GUID de cada reacción es el mismo
+  en el Mac y en el iPhone 5.
+* `Agent.log` del iPhone 5: **iOS 27 NO envía `amk`, `amt` ni `ame` al iPhone 5**. Envía `t` (texto en el idioma
+  del emisor), `gid`, `gv="8"`, `v="1"`, `pv=0`, `p` y, **solo en las reacciones**, `amrlc=0` y
+  `amrln=9223372036854775807`. Ningún mensaje normal capturado (4) lleva `amrlc`/`amrln`; los normales llevan `r`.
+* `arc`/`are` ("IA8T"/"dd85"), `aogre`/`aogrs` y las claves `CloudKit*` aparecen tanto en reacciones como en
+  mensajes normales: no sirven para distinguirlos.
+* El texto se decodifica en `JWDecodeDictionary` (IMFoundation) llamado desde `iMessage.imservice`
+  (`MessageServiceSession`).
+* Hipótesis siguiente: el emisor quita `amk`/`amt` porque el iPhone 5 no declara soporte al registrarse en IDS
+  (`FTRegistrationMessage`); en rustpush el registro declara p. ej. `supports-emoji-tapbacks`.
 
 ## 1. Fuentes
 
@@ -47,6 +62,8 @@ El GUID de un mensaje es el mismo en el emisor y en el receptor, así que el `GU
 
 El texto `t` lo genera **el iPhone que reacciona, en su idioma**. Las frases oficiales hay que sacarlas de los archivos de idioma de un sistema moderno (macOS 27 del MacBook Air), nunca inventarlas.
 
-Idiomas de iOS 6: la lista exacta se obtiene de las carpetas `*.lproj` de `ChatKit.framework` del iPhone 5.
+Idiomas de iOS 6 (ChatKit.framework del iPhone 5, 34): Dutch, English, French, German, Italian, Japanese, Spanish, ar, ca, cs, da, el, en_GB, fi, he, hr, hu, id, ko, ms, no, pl, pt, pt_PT, ro, ru, sk, sv, th, tr, uk, vi, zh_CN, zh_TW.
+
+macOS 27 (`TapbackTextualDescriptions-*.loctable`, 44 idiomas) cubre todos ellos más en_AU/CA/IN/PH, es_419/US, fr_CA, hi, sl, zh_HK. Esas tablas son las descripciones con nombre ("%@ ha reaccionado con %@ a “%@”."), no necesariamente el texto `t` de respaldo: falta comprobarlo con el texto real de `sms.db`.
 
 Añadidos hasta iOS 9.3 (según foros, **sin verificar**): iOS 8 añadió hindi y las variantes chino (Hong Kong), inglés (India) y francés (Canadá).

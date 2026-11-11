@@ -247,7 +247,7 @@ static void RXAInspect(CFPropertyListRef result, const char *via) {
 
 // Phase 1A.3: declare tapback support. iOS 27 strips amk/amt/ame from what it sends to the iPhone 5 (verified
 // 2026-11-11), most likely because this device does not announce the capability when it registers. Modern
-// devices put capability flags in services[service=com.apple.madrid].users[].client-data (rustpush,
+// devices put capability flags in client-data (top level on iOS 6; services[].users[].client-data in rustpush,
 // src/ids/user.rs and src/imessage/aps_client.rs). Only the two tapback flags are added, and only into a
 // client-data dictionary that already exists: nothing else changes. Off switch: create the file
 // /var/mobile/Library/Reactions/no-declare (then re-register).
@@ -260,6 +260,27 @@ static NSArray *RXATapbackFlags(void) {
 }
 
 static NSDictionary *RXAWithTapbackFlags(NSDictionary *body, NSUInteger *added, NSUInteger *users) {
+    // iOS 6 (verified 2026-11-11): one flat body per registration, client-data at the top level
+    // {capabilities, client-data={public-message-identity-key, public-message-identity-version, show-peer-errors},
+    //  device-name, hardware-version, os-version, software-version, validation-data}.
+    id topClientData = [body objectForKey:@"client-data"];
+    if ([topClientData isKindOfClass:[NSDictionary class]]) {
+        (*users)++;
+        NSMutableDictionary *newClientData = [topClientData mutableCopy];
+        for (NSString *flag in RXATapbackFlags()) {
+            if (![newClientData objectForKey:flag]) {
+                [newClientData setObject:[NSNumber numberWithBool:YES] forKey:flag];
+                (*added)++;
+            }
+        }
+        if (*added == 0) {
+            return body;
+        }
+        NSMutableDictionary *newBody = [body mutableCopy];
+        [newBody setObject:newClientData forKey:@"client-data"];
+        return newBody;
+    }
+    // Modern layout (rustpush): services[service=com.apple.madrid].users[].client-data.
     id services = [body objectForKey:@"services"];
     if (![services isKindOfClass:[NSArray class]]) {
         return body;

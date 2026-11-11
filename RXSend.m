@@ -23,6 +23,65 @@ static NSString *RXSendStripObjectReplacement(NSString *s) {
     return [s stringByReplacingOccurrencesOfString:@"\uFFFC" withString:@""];
 }
 
+// Phase 3 (real tapbacks): imagent (RXAgent.x) adds amk/amt/amrlc/amrln/ame/msi to the outgoing payload whose text
+// "t" equals an entry of this file (written just before -[IMChat sendMessage:], consumed by imagent, 120 s TTL).
+// Format verified on the Mac (chat.db): amk "p:<part>/<GUID>", amt 2000-2006 add / 3000-3006 remove.
+#define RX_OUTGOING_PATH    @"/var/mobile/Library/Reactions/Outgoing.plist"
+
+static long long RXSendAssociatedType(RXKind kind, BOOL removal) {
+    long long base;
+    switch (kind) {
+        case RXKindLove:     base = 2000; break;
+        case RXKindLike:     base = 2001; break;
+        case RXKindDislike:  base = 2002; break;
+        case RXKindLaugh:    base = 2003; break;
+        case RXKindEmph:     base = 2004; break;
+        case RXKindQuestion: base = 2005; break;
+        case RXKindEmoji:    base = 2006; break;
+        default:             return 0;      // stickers cannot be sent as real tapbacks
+    }
+    return removal ? base + 1000 : base;
+}
+
+static void RXSendRegisterRealTapback(NSString *text, NSString *guid, NSInteger partKey, RXKind kind, NSString *emoji,
+                                      BOOL removal, RXTarget target, NSString *quote) {
+    long long amt = RXSendAssociatedType(kind, removal);
+    if (!amt || !text.length || !guid.length) {
+        return;
+    }
+    @try {
+        NSDate *now = [NSDate date];
+        NSMutableArray *entries = [NSMutableArray array];
+        NSArray *old = [NSArray arrayWithContentsOfFile:RX_OUTGOING_PATH];
+        for (id e in old) {
+            NSDate *d = [e isKindOfClass:[NSDictionary class]] ? [e objectForKey:@"date"] : nil;
+            if ([d isKindOfClass:[NSDate class]] && [now timeIntervalSinceDate:d] < 120.0) {
+                [entries addObject:e];
+            }
+        }
+        NSInteger part = partKey >= 0 ? partKey : 0;
+        NSUInteger rangeLength = (target == RXTargetText && quote.length) ? quote.length : 1;
+        NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+        [entry setObject:text forKey:@"t"];
+        [entry setObject:[NSString stringWithFormat:@"p:%ld/%@", (long)part, guid] forKey:@"amk"];
+        [entry setObject:[NSNumber numberWithLongLong:amt] forKey:@"amt"];
+        [entry setObject:[NSNumber numberWithUnsignedInteger:rangeLength] forKey:@"amrln"];
+        if (kind == RXKindEmoji && emoji.length) {
+            [entry setObject:emoji forKey:@"ame"];
+        }
+        [entry setObject:(target == RXTargetText && quote) ? quote : @"" forKey:@"ams"];
+        [entry setObject:now forKey:@"date"];
+        [entries addObject:entry];
+        [[NSFileManager defaultManager] createDirectoryAtPath:RX_DATA_DIR withIntermediateDirectories:YES
+                                                   attributes:nil error:NULL];
+        BOOL ok = [entries writeToFile:RX_OUTGOING_PATH atomically:YES];
+        RXLog(@"send: real tapback amt %lld part %ld on %@ registered for imagent (%d)", amt, (long)part,
+              RXGUIDTail(guid), ok ? 1 : 0);
+    } @catch (NSException *exception) {
+        RXLog(@"send: could not register the real tapback (%@)", exception.name);
+    }
+}
+
 static void RXSendShowFailureAlert(void) {
     UIAlertView *alert = [[UIAlertView alloc] initWithTitle:@"Couldn\u2019t Send Reaction"
                                                     message:@"Messages couldn\u2019t send this reaction. Please try again."
@@ -154,6 +213,9 @@ BOOL RXSendReaction(CKTranscriptController *tc, NSString *guid, NSInteger partKe
         RXSendShowFailureAlert();
         return NO;
     }
+
+    // Real tapback fields for imagent (must exist before -sendMessage: encodes the payload).
+    RXSendRegisterRealTapback(text, guid, partKey, kind, emoji, removal, target, quote);
 
     // Record the GUID and the optimistic vote BEFORE sending, so a synchronous echo is recognised.
     RXStore *store = [RXStore storeForChatKey:chatKey create:YES];

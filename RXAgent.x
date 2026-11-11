@@ -286,6 +286,124 @@ static void RXAInspect(CFPropertyListRef result, const char *via) {
     return result;
 }
 
+#pragma mark - Outgoing (phase 3: real tapbacks)
+
+// MobileSMS (RXSend.m) writes Outgoing.plist just before sending a reaction text: [{t, amk, amt, amrln, ame?, ams,
+// date}]. When imagent encodes an outgoing payload whose "t" equals an entry, the tapback keys are added exactly as
+// Apple stores them (amk "p:<part>/<GUID>", amt, amrlc 0, amrln, ame, msi = bplist {amc 1, ams}). Everything else of
+// the payload is kept. Entries are consumed once and expire after 120 s.
+#define RXA_OUTGOING     @"/var/mobile/Library/Reactions/Outgoing.plist"
+static int gRXAOutgoingLogged;
+
+static NSDictionary *RXATakeOutgoingEntry(NSString *text) {
+    NSArray *entries = [NSArray arrayWithContentsOfFile:RXA_OUTGOING];
+    if (![entries count]) {
+        return nil;
+    }
+    NSDate *now = [NSDate date];
+    NSDictionary *found = nil;
+    NSMutableArray *keep = [NSMutableArray array];
+    for (id e in entries) {
+        if (![e isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDate *d = [e objectForKey:@"date"];
+        if (![d isKindOfClass:[NSDate class]] || [now timeIntervalSinceDate:d] > 120.0) {
+            continue;
+        }
+        if (!found && [[e objectForKey:@"t"] isEqual:text]) {
+            found = e;
+            continue;
+        }
+        [keep addObject:e];
+    }
+    if (found || [keep count] != [entries count]) {
+        [keep writeToFile:RXA_OUTGOING atomically:YES];
+    }
+    return found;
+}
+
+// Returns a patched copy, or nil to leave the payload alone.
+static NSDictionary *RXAPatchOutgoing(CFPropertyListRef plist) {
+    if (!plist || CFGetTypeID(plist) != CFDictionaryGetTypeID()) {
+        return nil;
+    }
+    CFDictionaryRef ref = (CFDictionaryRef)plist;
+    if (!CFDictionaryContainsKey(ref, CFSTR("t")) || !CFDictionaryContainsKey(ref, CFSTR("p")) ||
+        CFDictionaryContainsKey(ref, CFSTR("amk"))) {
+        return nil;
+    }
+    NSDictionary *dict = (__bridge NSDictionary *)plist;
+    id text = [dict objectForKey:@"t"];
+    if (![text isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+    if (gRXAOutgoingLogged < 20) {
+        gRXAOutgoingLogged++;
+        RXALog([NSString stringWithFormat:@"OUTGOING payload: %@", RXADescribeDict(dict, 0)]);
+    }
+    NSDictionary *entry = RXATakeOutgoingEntry(text);
+    if (!entry) {
+        return nil;
+    }
+    NSMutableDictionary *patched = [dict mutableCopy];
+    id amk = [entry objectForKey:@"amk"], amt = [entry objectForKey:@"amt"], amrln = [entry objectForKey:@"amrln"];
+    if (![amk isKindOfClass:[NSString class]] || ![amt isKindOfClass:[NSNumber class]]) {
+        return nil;
+    }
+    [patched setObject:amk forKey:@"amk"];
+    [patched setObject:amt forKey:@"amt"];
+    [patched setObject:[NSNumber numberWithInt:0] forKey:@"amrlc"];
+    [patched setObject:[amrln isKindOfClass:[NSNumber class]] ? amrln : [NSNumber numberWithInt:1] forKey:@"amrln"];
+    id ame = [entry objectForKey:@"ame"];
+    if ([ame isKindOfClass:[NSString class]] && [(NSString *)ame length]) {
+        [patched setObject:ame forKey:@"ame"];
+    }
+    id ams = [entry objectForKey:@"ams"];
+    NSDictionary *summary = [NSDictionary dictionaryWithObjectsAndKeys:
+                             [NSNumber numberWithInt:1], @"amc",
+                             [ams isKindOfClass:[NSString class]] ? ams : @"", @"ams", nil];
+    NSData *msi = [NSPropertyListSerialization dataWithPropertyList:summary format:NSPropertyListBinaryFormat_v1_0
+                                                            options:0 error:NULL];
+    if (msi) {
+        [patched setObject:msi forKey:@"msi"];
+    }
+    RXALog([NSString stringWithFormat:@"OUTGOING tapback added: amt=%@ amk=%@ -> %@", amt, amk,
+            RXADescribeDict(patched, 0)]);
+    return patched;
+}
+
+static CFPropertyListRef RXAOutgoingFilter(CFPropertyListRef plist, NSDictionary **holder) {
+    if (pthread_getspecific(gRXAGuardKey)) {
+        return plist;
+    }
+    pthread_setspecific(gRXAGuardKey, (void *)1);
+    @try {
+        NSDictionary *patched = RXAPatchOutgoing(plist);
+        if (patched) {
+            *holder = patched;
+            plist = (__bridge CFPropertyListRef)patched;
+        }
+    } @catch (NSException *e) {
+        RXALog(@"OUTGOING patch failed: original payload kept");
+    }
+    pthread_setspecific(gRXAGuardKey, NULL);
+    return plist;
+}
+
+%hookf(CFDataRef, CFPropertyListCreateData, CFAllocatorRef allocator, CFPropertyListRef propertyList,
+       CFPropertyListFormat format, CFOptionFlags options, CFErrorRef *error) {
+    NSDictionary *holder = nil;
+    CFPropertyListRef pl = RXAOutgoingFilter(propertyList, &holder);
+    return %orig(allocator, pl, format, options, error);
+}
+
+%hookf(CFDataRef, CFPropertyListCreateXMLData, CFAllocatorRef allocator, CFPropertyListRef propertyList) {
+    NSDictionary *holder = nil;
+    CFPropertyListRef pl = RXAOutgoingFilter(propertyList, &holder);
+    return %orig(allocator, pl);
+}
+
 #pragma mark - Registration (what iOS 6 declares to Apple's servers)
 
 // Phase 1A.3: declare tapback support. iOS 27 strips amk/amt/ame from what it sends to the iPhone 5 (verified
@@ -561,7 +679,7 @@ static void RXADumpClasses(NSString *reason) {
         } else {
             RXALog(@"FTRegistrationMessage not found: registration logging off");
         }
-        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 1A.6 (diagnostics + tapback declaration + query log)", (int)getpid()]);
+        RXALog([NSString stringWithFormat:@"agent loaded in imagent (pid %d), phase 3A (diagnostics + tapback declaration + real tapback sending)", (int)getpid()]);
         dispatch_queue_t bg = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), bg, ^{
             RXADumpClasses(@"30 s");
